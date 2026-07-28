@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Freight load packet extraction",
+  "description": "What Gemini returns for ONE PDF (one load). A packet contains several documents; each is described in the 'documents' array. This file is the human-readable spec — the machine version lives as a Pydantic model in pipeline/extract.py. Trim or add fields here to match what your ML actually needs, then mirror the change in extract.py and schema/bigquery_setup.sql.",
+  "type": "object",
+  "properties": {
+    "load_id": { "type": "string", "description": "= Drive folder name. Filled in by the script, not the model." },
+    "source_pdf": { "type": "string", "description": "gs:// path of the PDF. Filled in by the script." },
+    "packet_summary": { "type": "string", "description": "One-line description of what's in the packet." },
+    "documents": {
+      "type": "array",
+      "description": "One entry per distinct document found in the PDF.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "doc_type": {
+            "type": "string",
+            "enum": ["rate_confirmation", "bill_of_lading", "proof_of_delivery", "invoice", "lumper_receipt", "packing_list", "other"]
+          },
+          "page_range": { "type": "string", "description": "e.g. '1-2' or '3'." },
+          "confidence": { "type": "number", "description": "0.0-1.0 overall confidence for this document." },
+          "illegible": { "type": "boolean", "description": "true if any field could not be read clearly." },
+
+          "load_number":       { "type": ["string", "null"] },
+          "pro_number":        { "type": ["string", "null"] },
+          "bol_number":        { "type": ["string", "null"] },
+          "order_number":      { "type": ["string", "null"] },
+
+          "broker_name":       { "type": ["string", "null"] },
+          "broker_mc":         { "type": ["string", "null"] },
+          "carrier_name":      { "type": ["string", "null"] },
+          "carrier_mc":        { "type": ["string", "null"] },
+          "carrier_dot":       { "type": ["string", "null"] },
+          "carrier_scac":      { "type": ["string", "null"] },
+
+          "shipper_name":      { "type": ["string", "null"] },
+          "shipper_address":   { "type": ["string", "null"] },
+          "consignee_name":    { "type": ["string", "null"] },
+          "consignee_address": { "type": ["string", "null"] },
+
+          "origin_city":       { "type": ["string", "null"] },
+          "origin_state":      { "type": ["string", "null"] },
+          "origin_zip":        { "type": ["string", "null"] },
+          "destination_city":  { "type": ["string", "null"] },
+          "destination_state": { "type": ["string", "null"] },
+          "destination_zip":   { "type": ["string", "null"] },
+
+          "pickup_date":       { "type": ["string", "null"], "description": "YYYY-MM-DD" },
+          "delivery_date":     { "type": ["string", "null"], "description": "YYYY-MM-DD" },
+
+          "rate_total":        { "type": ["number", "null"] },
+          "line_haul":         { "type": ["number", "null"] },
+          "fuel_surcharge":    { "type": ["number", "null"] },
+          "currency":          { "type": ["string", "null"], "description": "e.g. USD" },
+
+          "commodity":         { "type": ["string", "null"] },
+          "weight":            { "type": ["number", "null"] },
+          "weight_unit":       { "type": ["string", "null"], "description": "lbs or kg" },
+          "pieces":            { "type": ["integer", "null"] },
+          "equipment_type":    { "type": ["string", "null"], "description": "van / reefer / flatbed" },
+          "freight_class":     { "type": ["string", "null"] },
+          "hazmat":            { "type": ["boolean", "null"] },
+
+          "delivered":         { "type": ["boolean", "null"], "description": "POD only" },
+          "received_by":       { "type": ["string", "null"], "description": "POD signee (often handwritten)" },
+          "signature_present": { "type": ["boolean", "null"] },
+          "exceptions_notes":  { "type": ["string", "null"], "description": "damage / OS&D notes" }
+        },
+        "required": ["doc_type", "page_range", "confidence"]
+      }
+    }
+  },
+  "required": ["documents"]
+}
