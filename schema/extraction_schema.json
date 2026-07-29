@@ -22,6 +22,7 @@
           "illegible": { "type": "boolean", "description": "true if any field could not be read clearly." },
 
           "load_number":       { "type": ["string", "null"] },
+          "rc_number":         { "type": ["string", "null"], "description": "the rate confirmation's own number, distinct from load_number" },
           "pro_number":        { "type": ["string", "null"] },
           "bol_number":        { "type": ["string", "null"] },
           "order_number":      { "type": ["string", "null"] },
@@ -57,6 +58,8 @@
           "weight":            { "type": ["number", "null"] },
           "weight_unit":       { "type": ["string", "null"], "description": "lbs or kg" },
           "pieces":            { "type": ["integer", "null"] },
+          "pallet_count":      { "type": ["integer", "null"], "description": "number of physical pallets" },
+          "pallet_spaces":     { "type": ["integer", "null"], "description": "pallet positions/spaces used, labeled PLT/SPCs/positions" },
           "equipment_type":    { "type": ["string", "null"], "description": "van / reefer / flatbed" },
           "freight_class":     { "type": ["string", "null"] },
           "hazmat":            { "type": ["boolean", "null"] },
