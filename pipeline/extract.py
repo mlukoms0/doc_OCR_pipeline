@@ -14,10 +14,13 @@ Run the PILOT first (LIMIT = 100), review in BigQuery, then set LIMIT = None.
 
 import csv
 import json
+import re
 import sys
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import fitz  # PyMuPDF — validates PDFs before they reach the models
 import httpx
@@ -34,7 +37,9 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 PROJECT_ID       = "144240581301"
 LOCATION         = "us-east1"          # Vertex/Gemini region (keep in sync with bucket)
 BUCKET           = "doc-archive67"
-LIMIT            = 100                  # PILOT: 100. Full run: set to None
+LIMIT            = 1000                  # PILOT: 100. Full run: set to None
+MAX_WORKERS      = 12                   # concurrent PDFs; lower this if you hit 429 rate limits
+NEWEST_FIRST     = True                 # True = highest load number (newest) first; False = oldest first
 DOCAI_LOCATION   = "us"                 # Document AI multi-region: "us" or "eu"
 OCR_PROCESSOR_ID = "a889dd87be6492b0"   # from the Document OCR processor you create
 # ===========================================
@@ -50,12 +55,26 @@ docai_client = documentai.DocumentProcessorServiceClient(
     client_options={"api_endpoint": f"{DOCAI_LOCATION}-documentai.googleapis.com"}
 )
 
+# ---- Usage tally (exact counts) + rough cost estimate ----
+# The token/page COUNTS are exact. The $ rates below are APPROXIMATE — verify on the
+# current Vertex AI + Document AI pricing pages and edit to match.
+GEMINI_INPUT_PER_1M    = 0.30    # Gemini 2.5 Flash, per 1M input tokens (USD, approx)
+GEMINI_OUTPUT_PER_1M   = 2.50    # per 1M output tokens (USD, approx)
+DOCAI_OCR_PER_1K_PAGES = 1.50    # Document AI OCR, per 1,000 pages (USD, approx)
+USAGE = {"ocr_pages": 0, "in_tokens": 0, "out_tokens": 0}
+_usage_lock = threading.Lock()   # USAGE is mutated from worker threads — guard the increments
+
 
 # ---- The schema Gemini must return (mirror of schema/extraction_schema.json) ----
 # NOTE: ocr_confidence is NOT here — the pipeline adds it after extraction, from
 # Document AI, so Gemini is never asked to invent it.
 class Document(BaseModel):
-    doc_type: str
+    # Literal (not str) so the response schema actually CONSTRAINS Gemini to these values.
+    # As a plain `str` it returned 21 different spellings; this pins it to the enum.
+    doc_type: Literal[
+        "rate_confirmation", "bill_of_lading", "proof_of_delivery",
+        "invoice", "lumper_receipt", "packing_list", "other",
+    ]
     page_range: str
     confidence: float
     illegible: bool = False
@@ -64,6 +83,7 @@ class Document(BaseModel):
     pro_number: Optional[str] = None
     bol_number: Optional[str] = None
     order_number: Optional[str] = None
+    rc_number: Optional[str] = None
 
     broker_name: Optional[str] = None
     broker_mc: Optional[str] = None
@@ -96,6 +116,8 @@ class Document(BaseModel):
     weight: Optional[float] = None
     weight_unit: Optional[str] = None
     pieces: Optional[int] = None
+    pallet_count: Optional[int] = None
+    pallet_spaces: Optional[int] = None
     equipment_type: Optional[str] = None
     freight_class: Optional[str] = None
     hazmat: Optional[bool] = None
@@ -126,7 +148,24 @@ Rules:
 - Use null for anything not present. If a value is present but you cannot read it clearly,
   use null and do NOT guess — especially numbers (rates, weights, MC/DOT numbers).
 - If any field on a document was hard to read, set "illegible": true and lower "confidence".
-- Dates must be YYYY-MM-DD. Money must be plain numbers (no $ or commas).
+- doc_type MUST be one of the allowed enum values. A rate confirmation is sometimes titled
+  "Load Confirmation", "Carrier Confirmation", or "Load Sheet" — classify all of those as
+  rate_confirmation. Anything that fits none of the values is "other".
+- carrier_name is the trucking COMPANY name, never a dispatcher or agent person's name.
+- Dates must be YYYY-MM-DD. Money and weights must be plain numbers (no $ or commas);
+  weight is a whole number of pounds unless the document clearly prints a fraction.
+- The RATE CONFIRMATION is the authoritative document for a load — when a value differs
+  between documents, trust the rate confirmation. From rate confirmations, capture:
+  * load_number — the shared reference that also appears on the BOL and POD.
+  * rc_number — the rate confirmation's OWN document number, distinct from load_number.
+    load_number is shared across documents; rc_number identifies the confirmation itself
+    and appears only on rate confirmations. Do not copy load_number into rc_number.
+  * rate_total, line_haul, and fuel_surcharge.
+  * total weight.
+  * pallet_count (number of physical pallets) and pallet_spaces (pallet positions/spaces
+    used in the trailer) — look for labels like PLT, PLTS, SPACE, SPCs, or "positions".
+  * the FULL commodity description.
+  * broker_name.
 Return only JSON matching the schema."""
 
 
@@ -135,14 +174,18 @@ def load_id_from_pdf(blob_name: str) -> str:
     return blob_name[len(PDF_PREFIX):].split("/")[0]
 
 
-def find_multi_pdf_loads() -> set:
-    """Group PDFs by load. Loads with exactly one PDF are processed; loads with more
-    than one are RECORDED and skipped for now (multi-doc support comes later).
-    Never raises. Returns the set of load_ids to skip."""
+def _load_num(blob_name: str) -> int:
+    """Numeric sort key for a load id (the folder name). Non-numeric ids sort last."""
+    lid = load_id_from_pdf(blob_name)
+    return int(lid) if lid.isdigit() else -1
+
+
+def find_multi_pdf_loads(pdf_blobs) -> set:
+    """Group the given PDF blobs by load. Loads with exactly one PDF are processed; loads
+    with more than one are RECORDED (multidocs.csv + GCS manifest) and skipped for now
+    (multi-doc support comes later). Never raises. Returns the set of load_ids to skip."""
     loads = defaultdict(list)
-    for blob in storage_client.list_blobs(BUCKET, prefix=PDF_PREFIX):
-        if not blob.name.lower().endswith(".pdf"):
-            continue
+    for blob in pdf_blobs:
         loads[load_id_from_pdf(blob.name)].append(blob.name)
 
     multi = {lid: files for lid, files in loads.items() if len(files) > 1}
@@ -192,7 +235,8 @@ def validate_pdf(pdf_bytes: bytes) -> None:
 
 
 def ocr_document(pdf_bytes: bytes):
-    """Run Document AI OCR. Returns (full_text, per_page_mean_confidence)."""
+    """Run Document AI OCR. Returns (full_text, per_page_text, per_page_mean_confidence).
+    per_page_text lets the cross-check verify a document against ONLY its own pages."""
     name = docai_client.processor_path(PROJECT_ID, DOCAI_LOCATION, OCR_PROCESSOR_ID)
     result = docai_client.process_document(
         request=documentai.ProcessRequest(
@@ -201,11 +245,17 @@ def ocr_document(pdf_bytes: bytes):
         )
     )
     doc = result.document
-    page_conf = []
+    full_text = doc.text or ""
+    with _usage_lock:
+        USAGE["ocr_pages"] += len(doc.pages)    # every page here is a billable OCR page
+    page_conf, page_text = [], []
     for page in doc.pages:
         confs = [t.layout.confidence for t in page.tokens if t.layout and t.layout.confidence]
         page_conf.append(round(sum(confs) / len(confs), 3) if confs else 0.0)
-    return doc.text, page_conf
+        # slice this page's own text out of the full document text (for page-scoped checks)
+        segs = page.layout.text_anchor.text_segments if page.layout and page.layout.text_anchor else []
+        page_text.append("".join(full_text[int(s.start_index):int(s.end_index)] for s in segs))
+    return full_text, page_text, page_conf
 
 
 def pages_from_range(page_range: str):
@@ -234,6 +284,51 @@ def ocr_confidence_for(page_range: str, page_conf) -> Optional[float]:
     return round(sum(vals) / len(vals), 3)
 
 
+def page_text_for(page_range: str, page_text) -> str:
+    """OCR text of ONLY the pages this document spans (falls back to all pages)."""
+    if not page_text:
+        return ""
+    parts = [page_text[p - 1] for p in pages_from_range(page_range) if 1 <= p <= len(page_text)]
+    return " ".join(parts) if parts else " ".join(page_text)
+
+
+# Fields worth cross-checking against the OCR text — the hallucination-prone ones
+# (money + identifiers). Dates/names are skipped: Gemini reformats them, so a literal
+# match would false-alarm.
+KEY_FIELDS = [
+    "load_number", "pro_number", "bol_number", "order_number", "rc_number",
+    "broker_mc", "carrier_mc", "carrier_dot", "carrier_scac",
+    "rate_total", "line_haul", "fuel_surcharge", "weight", "pallet_count",
+]
+
+_NON_ALNUM = re.compile(r"[^a-z0-9]")
+
+
+def _norm(value) -> str:
+    """Lowercase, keep only letters/digits (so '$1,850.00' -> '185000')."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return _NON_ALNUM.sub("", str(value).lower())
+
+
+def verify_document(doc_dict: dict, norm_text: str) -> str:
+    """Deterministic cross-check (NO AI, NO cost): which KEY_FIELDS hold a value that
+    does NOT appear in the OCR text of THIS document's own pages? Catches hallucinated
+    values. `norm_text` is the already-normalized text for the doc's page range.
+    Returns a comma-joined list of field names ('' if all verified)."""
+    unverified = []
+    for field in KEY_FIELDS:
+        value = doc_dict.get(field)
+        if value in (None, "", []):
+            continue
+        norm_value = _norm(value)
+        if len(norm_value) < 3:
+            continue                       # too short to verify without false alarms
+        if norm_value not in norm_text:
+            unverified.append(field)
+    return ",".join(unverified)
+
+
 def is_transient(exc: BaseException) -> bool:
     """Retry ONLY errors that could succeed next time: network hiccups, rate limits,
     and 5xx from either Gemini or Document AI. Malformed PDFs, permission denied (403),
@@ -259,14 +354,15 @@ def is_transient(exc: BaseException) -> bool:
     reraise=True,
 )
 def extract_one(pdf_uri: str, pdf_bytes: bytes):
-    """OCR the packet, then have Gemini read image + OCR text. Returns (packet, page_conf)."""
-    ocr_text, page_conf = ocr_document(pdf_bytes)
+    """OCR the packet, then have Gemini read image + OCR text.
+    Returns (packet, page_conf, page_text)."""
+    full_text, page_text, page_conf = ocr_document(pdf_bytes)
 
     resp = client.models.generate_content(
         model=MODEL,
         contents=[
             types.Part.from_uri(file_uri=pdf_uri, mime_type="application/pdf"),
-            f"OCR TEXT (from Document AI — use for exact numbers/IDs):\n{ocr_text}",
+            f"OCR TEXT (from Document AI — use for exact numbers/IDs):\n{full_text}",
             PROMPT,
         ],
         config=types.GenerateContentConfig(
@@ -275,8 +371,13 @@ def extract_one(pdf_uri: str, pdf_bytes: bytes):
             temperature=0,
         ),
     )
+    um = resp.usage_metadata
+    if um is not None:
+        with _usage_lock:
+            USAGE["in_tokens"] += getattr(um, "prompt_token_count", 0) or 0
+            USAGE["out_tokens"] += getattr(um, "candidates_token_count", 0) or 0
     packet = resp.parsed if resp.parsed is not None else Packet(**json.loads(resp.text))
-    return packet, page_conf
+    return packet, page_conf, page_text
 
 
 def already_done() -> set:
@@ -288,58 +389,107 @@ def already_done() -> set:
     return done
 
 
+def print_cost_summary(processed: int):
+    """Print exact usage for THIS run + an approximate cost (rates are editable constants)."""
+    ocr_cost = USAGE["ocr_pages"] / 1_000 * DOCAI_OCR_PER_1K_PAGES
+    in_cost = USAGE["in_tokens"] / 1_000_000 * GEMINI_INPUT_PER_1M
+    out_cost = USAGE["out_tokens"] / 1_000_000 * GEMINI_OUTPUT_PER_1M
+    total = ocr_cost + in_cost + out_cost
+    print("---- usage this run (counts exact, $ approximate) ----")
+    print(f"  Document AI  : {USAGE['ocr_pages']:,} pages   ~${ocr_cost:.4f}")
+    print(f"  Gemini input : {USAGE['in_tokens']:,} tokens  ~${in_cost:.4f}")
+    print(f"  Gemini output: {USAGE['out_tokens']:,} tokens  ~${out_cost:.4f}")
+    print(f"  TOTAL (est)  : ~${total:.4f}")
+    if processed:
+        print(f"  Per doc      : ~${total / processed:.5f}   →  19,000 docs ≈ ${total / processed * 19000:.2f}")
+
+
+def process_blob(blob):
+    """Worker (runs in a thread): OCR + extract ONE pdf and write its JSON.
+    Returns (status, load_id, detail) where status is 'ok' | 'invalid' | 'failed'.
+    No shared mutable state except USAGE, which is guarded by _usage_lock inside
+    ocr_document/extract_one. Each PDF's JSON is an independent object, so concurrent
+    writes never collide and resumability is preserved."""
+    load_id = load_id_from_pdf(blob.name)
+    pdf_uri = f"gs://{BUCKET}/{blob.name}"
+    try:
+        pdf_bytes = blob.download_as_bytes()
+    except Exception as e:                           # noqa: BLE001
+        return ("failed", load_id, f"download: {e}")
+
+    # Pre-flight: skip broken PDFs before spending an OCR + Gemini call.
+    try:
+        validate_pdf(pdf_bytes)
+    except Exception as e:
+        bucket.blob(f"logs/invalid/{load_id}.txt").upload_from_string(str(e))
+        return ("invalid", load_id, str(e))
+
+    try:
+        packet, page_conf, page_text = extract_one(pdf_uri, pdf_bytes)
+        record = packet.model_dump()
+        record["load_id"] = load_id
+        record["source_pdf"] = pdf_uri
+        # Confidence + cross-check, each scoped to the document's OWN pages.
+        for doc_obj, doc_dict in zip(packet.documents, record["documents"]):
+            doc_dict["ocr_confidence"] = ocr_confidence_for(doc_obj.page_range, page_conf)
+            scoped = _norm(page_text_for(doc_obj.page_range, page_text))
+            doc_dict["unverified_fields"] = verify_document(doc_dict, scoped)
+        bucket.blob(f"{JSON_PREFIX}{load_id}.json").upload_from_string(
+            json.dumps(record), content_type="application/json"
+        )
+        return ("ok", load_id, "")
+    except Exception as e:                           # noqa: BLE001 — isolate per-doc failures
+        bucket.blob(f"logs/failed/{load_id}.txt").upload_from_string(str(e))
+        return ("failed", load_id, str(e))
+
+
 def main():
-    skip_multi = find_multi_pdf_loads()
+    # ONE listing of the PDFs — reused for the multi-PDF check AND the work list.
+    all_pdfs = [b for b in storage_client.list_blobs(BUCKET, prefix=PDF_PREFIX)
+                if b.name.lower().endswith(".pdf")]
+    # list_blobs returns ascending load number (oldest first); sort newest-first if configured.
+    all_pdfs.sort(key=lambda b: _load_num(b.name), reverse=NEWEST_FIRST)
+    skip_multi = find_multi_pdf_loads(all_pdfs)
+    done = already_done()                            # separate prefix (json/); listed once
+    print(f"{len(all_pdfs)} PDFs found; {len(done)} loads already done; "
+          f"{len(skip_multi)} multi-PDF loads skipped.")
 
-    done = already_done()
-    print(f"{len(done)} loads already processed — skipping those.")
-
-    processed = 0
-    for b in storage_client.list_blobs(BUCKET, prefix=PDF_PREFIX):
-        if not b.name.lower().endswith(".pdf"):
-            continue
+    # Build the work list (skip already-done + multi-PDF), capped at LIMIT.
+    work = []
+    for b in all_pdfs:
         load_id = load_id_from_pdf(b.name)
-        if load_id in done:
+        if load_id in done or load_id in skip_multi:
             continue
-        if load_id in skip_multi:
-            continue          # multiple PDFs in this folder — deferred to multi-doc support
-        if LIMIT is not None and processed >= LIMIT:
-            print(f"Reached LIMIT ({LIMIT}). Stopping.")
+        work.append(b)
+        if LIMIT is not None and len(work) >= LIMIT:
             break
 
-        pdf_uri = f"gs://{BUCKET}/{b.name}"
-        pdf_bytes = b.download_as_bytes()
+    print(f"Processing {len(work)} loads with {MAX_WORKERS} concurrent workers...")
+    ok = failed = invalid = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(process_blob, b): b for b in work}
+        for i, fut in enumerate(as_completed(futures), 1):
+            b = futures[fut]
+            try:
+                status, load_id, detail = fut.result()
+            except Exception as e:                   # noqa: BLE001 — a worker crashed unexpectedly
+                failed += 1
+                print(f"[FAIL] {load_id_from_pdf(b.name)}: worker crashed: {e}", file=sys.stderr)
+                continue
+            if status == "ok":
+                ok += 1
+                print(f"[ok] {load_id}")
+            elif status == "invalid":
+                invalid += 1
+                print(f"[skip invalid] {load_id}: {detail}", file=sys.stderr)
+            else:
+                failed += 1
+                print(f"[FAIL] {load_id}: {detail}", file=sys.stderr)
+            if i % 50 == 0:
+                print(f"  ...{i}/{len(work)}  (ok={ok} failed={failed} invalid={invalid})")
 
-        # Pre-flight: skip broken PDFs before spending an OCR + Gemini call.
-        try:
-            validate_pdf(pdf_bytes)
-        except Exception as e:
-            bucket.blob(f"logs/invalid/{load_id}.txt").upload_from_string(str(e))
-            print(f"[skip invalid] {load_id}: {e}", file=sys.stderr)
-            continue
-
-        try:
-            packet, page_conf = extract_one(pdf_uri, pdf_bytes)
-            record = packet.model_dump()
-            record["load_id"] = load_id
-            record["source_pdf"] = pdf_uri
-            # Attach Document AI's confidence to each document (trustworthy signal).
-            for doc_obj, doc_dict in zip(packet.documents, record["documents"]):
-                doc_dict["ocr_confidence"] = ocr_confidence_for(doc_obj.page_range, page_conf)
-
-            bucket.blob(f"{JSON_PREFIX}{load_id}.json").upload_from_string(
-                json.dumps(record), content_type="application/json"
-            )
-            done.add(load_id)
-            processed += 1
-            if processed % 25 == 0:
-                print(f"  ...{processed} processed")
-            print(f"[ok] {load_id}")
-        except Exception as e:                       # noqa: BLE001 — isolate per-doc failures
-            bucket.blob(f"logs/failed/{load_id}.txt").upload_from_string(str(e))
-            print(f"[FAIL] {load_id}: {e}", file=sys.stderr)
-
-    print(f"Done. {processed} new loads processed this run.")
+    print(f"Done. ok={ok}, failed={failed}, invalid={invalid} of {len(work)} attempted.")
+    print_cost_summary(ok)
 
 
 if __name__ == "__main__":
