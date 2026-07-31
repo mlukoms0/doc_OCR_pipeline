@@ -1,12 +1,21 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Freight load packet extraction",
-  "description": "What Gemini returns for ONE PDF (one load). A packet contains several documents; each is described in the 'documents' array. This file is the human-readable spec — the machine version lives as a Pydantic model in pipeline/extract.py. Trim or add fields here to match what your ML actually needs, then mirror the change in extract.py and schema/bigquery_setup.sql.",
+  "description": "What Gemini returns for ONE PDF (one load). A packet contains several documents; each is described in the 'documents' array. This file is the human-readable spec \u2014 the machine version is the Pydantic model in pipeline/extract.py, and the BigQuery DDL in schema/bigquery_setup.sql is generated from that same model. Change the Pydantic model first, then regenerate the other two. 66 fields per document.",
   "type": "object",
   "properties": {
-    "load_id": { "type": "string", "description": "= Drive folder name. Filled in by the script, not the model." },
-    "source_pdf": { "type": "string", "description": "gs:// path of the PDF. Filled in by the script." },
-    "packet_summary": { "type": "string", "description": "One-line description of what's in the packet." },
+    "load_id": {
+      "type": "string",
+      "description": "= Drive folder name. Filled by the script, not the model. This is the JOIN KEY."
+    },
+    "source_pdf": {
+      "type": "string",
+      "description": "gs:// path of the PDF. Filled by the script."
+    },
+    "packet_summary": {
+      "type": "string",
+      "description": "One-line description of what's in the packet."
+    },
     "documents": {
       "type": "array",
       "description": "One entry per distinct document found in the PDF.",
@@ -15,63 +24,595 @@
         "properties": {
           "doc_type": {
             "type": "string",
-            "enum": ["rate_confirmation", "bill_of_lading", "proof_of_delivery", "invoice", "lumper_receipt", "packing_list", "other"]
+            "enum": [
+              "rate_confirmation",
+              "bill_of_lading",
+              "proof_of_delivery",
+              "invoice",
+              "lumper_receipt",
+              "packing_list",
+              "other"
+            ],
+            "description": "What the page says it is. Enum \u2014 a plain str returned 21 spellings."
           },
-          "page_range": { "type": "string", "description": "e.g. '1-2' or '3'." },
-          "confidence": { "type": "number", "description": "0.0-1.0 overall confidence for this document." },
-          "illegible": { "type": "boolean", "description": "true if any field could not be read clearly." },
-
-          "load_number":       { "type": ["string", "null"] },
-          "rc_number":         { "type": ["string", "null"], "description": "the rate confirmation's own number, distinct from load_number" },
-          "pro_number":        { "type": ["string", "null"] },
-          "bol_number":        { "type": ["string", "null"] },
-          "order_number":      { "type": ["string", "null"] },
-
-          "broker_name":       { "type": ["string", "null"] },
-          "broker_mc":         { "type": ["string", "null"] },
-          "carrier_name":      { "type": ["string", "null"] },
-          "carrier_mc":        { "type": ["string", "null"] },
-          "carrier_dot":       { "type": ["string", "null"] },
-          "carrier_scac":      { "type": ["string", "null"] },
-
-          "shipper_name":      { "type": ["string", "null"] },
-          "shipper_address":   { "type": ["string", "null"] },
-          "consignee_name":    { "type": ["string", "null"] },
-          "consignee_address": { "type": ["string", "null"] },
-
-          "origin_city":       { "type": ["string", "null"] },
-          "origin_state":      { "type": ["string", "null"] },
-          "origin_zip":        { "type": ["string", "null"] },
-          "destination_city":  { "type": ["string", "null"] },
-          "destination_state": { "type": ["string", "null"] },
-          "destination_zip":   { "type": ["string", "null"] },
-
-          "pickup_date":       { "type": ["string", "null"], "description": "YYYY-MM-DD" },
-          "delivery_date":     { "type": ["string", "null"], "description": "YYYY-MM-DD" },
-
-          "rate_total":        { "type": ["number", "null"] },
-          "line_haul":         { "type": ["number", "null"] },
-          "fuel_surcharge":    { "type": ["number", "null"] },
-          "currency":          { "type": ["string", "null"], "description": "e.g. USD" },
-
-          "commodity":         { "type": ["string", "null"] },
-          "weight":            { "type": ["number", "null"] },
-          "weight_unit":       { "type": ["string", "null"], "description": "lbs or kg" },
-          "pieces":            { "type": ["integer", "null"] },
-          "pallet_count":      { "type": ["integer", "null"], "description": "number of physical pallets" },
-          "pallet_spaces":     { "type": ["integer", "null"], "description": "pallet positions/spaces used, labeled PLT/SPCs/positions" },
-          "equipment_type":    { "type": ["string", "null"], "description": "van / reefer / flatbed" },
-          "freight_class":     { "type": ["string", "null"] },
-          "hazmat":            { "type": ["boolean", "null"] },
-
-          "delivered":         { "type": ["boolean", "null"], "description": "POD only" },
-          "received_by":       { "type": ["string", "null"], "description": "POD signee (often handwritten)" },
-          "signature_present": { "type": ["boolean", "null"] },
-          "exceptions_notes":  { "type": ["string", "null"], "description": "damage / OS&D notes" }
+          "page_range": {
+            "type": "string",
+            "description": "e.g. '1-2' or '3'."
+          },
+          "illegible": {
+            "type": "boolean",
+            "description": "true if any field could not be read clearly. Replaced the self-reported 'confidence' float (77.3% returned exactly 1.0)."
+          },
+          "is_signed_delivery_copy": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "ROLE, not type. true when this document carries a receiver's signature/stamp \u2014 a signed BOL IS the proof of delivery. Fixes a POD rate of 14% when it should be ~100%."
+          },
+          "delivery_signed_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "YYYY-MM-DD from beside the delivery signature."
+          },
+          "load_number": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "the load's reference as printed on THIS document; a cross-check, not a join key"
+          },
+          "pro_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bol_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "order_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rc_number": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "the rate confirmation's own number; often the same single number as load_number"
+          },
+          "broker_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "broker_mc": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "carrier_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "carrier_mc": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "carrier_dot": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "carrier_scac": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shipper_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shipper_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consignee_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consignee_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin_city": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin_zip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination_city": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination_zip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pickup_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pickup_appt_start": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "HH:MM 24-hour"
+          },
+          "pickup_appt_end": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_appt_start": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "HH:MM 24-hour"
+          },
+          "delivery_appt_end": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rate_total": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "total carrier pay, all-in"
+          },
+          "line_haul": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "ONLY a separate printed line-haul item that differs from the total. Never a copy of rate_total."
+          },
+          "fuel_surcharge": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "ONLY an FSC charge that is part of that total. A fuel surcharge SCHEDULE is not a charge."
+          },
+          "rate_is_all_in": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "true = one total, no breakdown; false = a real breakdown is printed"
+          },
+          "currency": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "miles": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "loaded miles as printed. Rate-per-mile is the headline freight ML feature."
+          },
+          "payment_net_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "net payment terms in days"
+          },
+          "quick_pay_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "quick-pay discount percentage"
+          },
+          "commodity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "weight": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "weight_unit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "lb",
+              "kg"
+            ],
+            "description": "enum lb|kg \u2014 six spellings of pounds appeared as free text, and a null read as pounds when the doc was kg is a 2.2x error"
+          },
+          "pieces": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "cartons/cases/units, NOT pallets"
+          },
+          "pallet_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "physical pallets. Clamped to 1-60 in the gold layer; silver saw values up to 3,165."
+          },
+          "pallet_spaces": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "trailer positions, only when a distinct figure is printed"
+          },
+          "equipment_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "dry_van",
+              "reefer",
+              "flatbed",
+              "step_deck",
+              "power_only",
+              "container",
+              "tanker",
+              "other"
+            ],
+            "description": "enum \u2014 replaces free-text equipment_type, which had 100+ spellings of '53 dry van'"
+          },
+          "equipment_length_ft": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "trailer length in feet, pulled out of the equipment string"
+          },
+          "is_team": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "equipment_type_raw": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "the verbatim equipment string, so nothing is lost"
+          },
+          "temperature_setpoint_f": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "reefer set point in Fahrenheit"
+          },
+          "temperature_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "continuous",
+              "cycle"
+            ],
+            "description": "continuous or cycle"
+          },
+          "freight_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hazmat": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "seal_number": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "seal on the trailer; matters for claims"
+          },
+          "delivered": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "POD only"
+          },
+          "received_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "POD signee (often handwritten)"
+          },
+          "signature_present": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "exceptions_notes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "damage / OS&D notes"
+          },
+          "pieces_received": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "what the receiver signed for, vs `pieces` shipped. The gap is the claim."
+          },
+          "osd_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "clear",
+              "shortage",
+              "overage",
+              "damage",
+              "refused"
+            ],
+            "description": "over / short / damage outcome"
+          },
+          "stops": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sequence": {
+                  "type": "integer"
+                },
+                "stop_type": {
+                  "type": "string",
+                  "enum": [
+                    "pickup",
+                    "delivery"
+                  ]
+                },
+                "name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "address": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "city": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "zip": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "scheduled_date": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "appt_start": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "appt_end": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "appt_type": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "appointment",
+                    "fcfs"
+                  ]
+                },
+                "reference_number": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "description": "FULL itinerary, one entry per pickup and delivery. origin_*/destination_* are only the first and last."
+          },
+          "accessorials": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "detention_pickup",
+                    "detention_delivery",
+                    "layover",
+                    "tonu",
+                    "lumper",
+                    "stop_off",
+                    "driver_assist",
+                    "tarp",
+                    "reconsignment",
+                    "unloading",
+                    "other"
+                  ]
+                },
+                "amount": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "notes": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "description": "every charge beyond the line haul \u2014 detention, layover, TONU, lumper, stop-off. Carrier revenue that was previously invisible."
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ref_type": {
+                  "type": "string",
+                  "enum": [
+                    "po",
+                    "pickup",
+                    "delivery",
+                    "appointment",
+                    "customer",
+                    "trailer",
+                    "container",
+                    "seal",
+                    "other"
+                  ]
+                },
+                "value": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "PO / pickup / delivery / appointment / trailer / container / seal numbers, which order_number used to absorb indiscriminately."
+          },
+          "rate_total_evidence": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "verbatim source text for rate_total, e.g. '$1,600.00'. Checked against the OCR text \u2014 replaces self-reported confidence with something verifiable."
+          },
+          "weight_evidence": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "verbatim source text for weight, e.g. '32,268 LBS'"
+          }
         },
-        "required": ["doc_type", "page_range", "confidence"]
+        "required": [
+          "doc_type",
+          "page_range"
+        ]
       }
     }
   },
-  "required": ["documents"]
+  "required": [
+    "documents"
+  ]
 }
