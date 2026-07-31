@@ -26,6 +26,7 @@ import json
 import re
 import sys
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -44,56 +45,31 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 
 # ============ EDIT THESE VALUES ============
 PROJECT_ID       = "144240581301"
-LOCATION         = "us-east1"          # Vertex/Gemini region (keep in sync with bucket)
+LOCATION         = "us-east1"         
 BUCKET           = "doc-archive67"
 #Set limit = <int> for test runs, = None for full run.
-LIMIT            = 500     
-#Doc concurrency scans. Limit to avoid api request errors. default = 12             
-MAX_WORKERS      = 12                  
-NEWEST_FIRST     = True                 
+LIMIT            = None     
+#Doc concurrency scans. Limit to avoid api request errors. default = 12
+MAX_WORKERS      = 10
+NEWEST_FIRST     = False                 
 DOCAI_LOCATION   = "us"
 OCR_PROCESSOR_ID = "a889dd87be6492b0"
 
 # Page images sent to Gemini.
-#
-# Gemini bills images by TILE COUNT, not by DPI: anything larger than 384px is cut
-# into 768x768 tiles at 258 tokens each. So what matters is PIXEL DIMENSIONS, and the
-# cost is a STAIRCASE, not a slope. Capping the long edge at 1536 (= 2 x 768) pins
-# every page to at most a 2x2 grid = 4 tiles = 1,032 tokens.
-#
-# This replaces the old RENDER_DPI = 150, which was a real mistake: US Letter at
-# 150 DPI is 1275x1650, and 1650 spills 114px past 1536 into a THIRD tile row —
-# 6 tiles instead of 4, 50% more input tokens bought for 114 pixels of margin.
-# Worse, 140 through 175 DPI all cost the SAME 6 tiles, so 150 was also giving up
-# resolution for free. A dimension cap is the right knob because it holds for
-# Letter, Legal, A4 and odd scan sizes alike — a DPI constant does not (A4 at
-# 139 DPI is 1625px tall and spills into 3 rows again).
-#
-# Exact digits come from the Document AI OCR text, so the image only has to carry
-# layout, boundaries and classification — 1536px is ample for that.
 MAX_PAGE_PX      = 1536   # long-edge cap in pixels; keep <= 1536 to stay at 4 tiles
 JPEG_QUALITY     = 75
 
 # Cache the Document AI OCR result in GCS, keyed by load_id, and reuse it on re-runs.
-# OCR is ~26% of the bill and its output NEVER changes for a given PDF, so paying for
-# it twice is pure waste. The prompt/schema will change again; the OCR will not.
 CACHE_OCR        = True
 
-# -1 = dynamic thinking (what the model did implicitly before this was set — same
-# behaviour, now measured and easy to change). 0 = thinking off, cheapest.
-# Thinking tokens bill at the OUTPUT rate and are now counted in the tally, so
-# pilot both and compare the printed cost against extraction quality.
+# Max pages per synchronous Document AI call. The API allows 15 in normal mode and 30 in
+# IMAGELESS mode; ocr_document() sets imageless_mode=True  30 without switching to batch_process_documents.
+OCR_PAGE_LIMIT   = 30
+
+# -1 = dynamic thinking 
+# 0 = thinking off, cheapest.
+# 
 THINKING_BUDGET   = -1
-# Thinking is charged against THIS budget, not a separate one - proved on 2026-07-30
-# when every MAX_TOKENS failure landed on exactly thinking + output = 16,370, i.e. 14
-# short of the then-current 16,384 ceiling.
-#
-# Back to 16,384 on purpose. Raising it to 32,768 did NOT reduce the ~3% failure rate:
-# output simply doubled to 27,769-29,274 to fill the extra room, which is the signature
-# of a repetition loop rather than a genuinely large packet. A higher ceiling therefore
-# buys nothing but a bigger bill for each failure (~$37 vs ~$15 across the backfill).
-# A legitimate worst case is roughly 6 documents x ~630 tokens = ~4,000, so 16,384 is
-# ample for real work while capping the damage from a runaway.
 MAX_OUTPUT_TOKENS = 16384
 # ===========================================
 
@@ -102,19 +78,9 @@ MAX_OUTPUT_TOKENS = 16384
 PDF_PREFIX  = "raw/loads/"
 # Output prefix. BUMP THIS instead of deleting, whenever the prompt or schema changes.
 #
-# It is the ONLY thing already_done() looks at, so a new prefix is a clean slate: nothing
-# is skipped, nothing is destroyed, and the previous extraction stays in GCS for
-# side-by-side comparison. Deleting json/ would achieve the same re-run but throw away the
-# evidence you need to tell whether the change actually helped.
-#
 # Point `bq load` at whichever prefix you want in BigQuery.
-#   json/     = 500-packet run, 2026-07-30 (66-field schema, pre round-2 prompt fixes)
-#   json_v4/  = current: + money decision-test, reference selectivity, temperature rule
-JSON_PREFIX = "json_v4/"
 
-# Deliberately NOT versioned. Document AI output never changes for a given PDF, so the
-# cache stays valid across every prompt and schema revision - which is what makes a
-# re-run cost Gemini only (~$9 for 500 packets instead of ~$12).
+JSON_PREFIX = "json_final/"
 OCR_PREFIX  = "ocr/"          # cached Document AI output, one <load_id>.json per packet
 MODEL       = "gemini-2.5-flash"
 
@@ -128,39 +94,23 @@ docai_client = documentai.DocumentProcessorServiceClient(
 # ---- Usage tally (exact counts) + rough cost estimate ----
 # Rates are approximate
 # current Vertex AI + Document AI pricing pages (07/26)
-# UNVERIFIED against a real invoice — the COUNTS below are exact, these RATES are not.
-# The 2026-07-29 run billed $6.41 of Document AI against ~4,959 pages actually present
-# in the packets, which implies ~$1.29/1k, not $1.50 — so either this constant is wrong
-# or the page count is. print_cost_summary() prints the exact division to settle it.
-# Reconcile all three against the GCP billing console before trusting any projection.
+
 GEMINI_INPUT_PER_1M    = 0.30    # Gemini 2.5 Flash, per 1M input tokens
 GEMINI_OUTPUT_PER_1M   = 2.50    # per 1M output tokens (thinking bills at THIS rate)
 DOCAI_OCR_PER_1K_PAGES = 1.50    # Document AI OCR, per 1,000 pages
-# Real processable corpus, from the 2026-07-30 listing: 17,388 loads minus 276 multi-PDF.
-# Every projection before this used a round 19,000, overstating the backfill by ~11%.
 BACKFILL_LOADS         = 17112
-# think_tokens is tracked SEPARATELY but billed at the OUTPUT rate. The SDK reports
-# it as `thoughts_token_count`, which is NOT included in `candidates_token_count` —
-# leaving it out silently under-counted the run (and the 19k projection).
 USAGE = {
     "ocr_pages": 0, "in_tokens": 0, "out_tokens": 0, "think_tokens": 0,
     "total_tokens": 0,       # the SDK's own total, used to self-check the components
-    "ocr_cache_hits": 0,     # packets served from the OCR cache (Document AI cost $0)
+    "ocr_cache_hits": 0,     # packets served from the OCR cache 
     "no_usage_meta": 0,      # calls that reported no usage at all -> tokens we cannot see
-    "tally_mismatch": 0,     # calls where our components != the SDK total -> a missed category
+    "tally_mismatch": 0,     # components != the SDK total -> a missed category
     "truncated": 0,          # calls that stopped for any reason other than STOP
 }
 _usage_lock = threading.Lock()
 
 
-# ---- The schema Gemini must return (mirror of schema/extraction_schema.json) ----
-# NOTE: ocr_confidence is NOT here — the pipeline adds it after extraction, from
-# Document AI, so Gemini is never asked to invent it.
-
-
 class Stop(BaseModel):
-    """One pickup or delivery. The old flat origin_*/destination_* pair silently threw
-    away every intermediate stop on a multi-stop load — and multi-stop is common."""
     sequence: int
     stop_type: Literal["pickup", "delivery"]
     name: Optional[str] = None
@@ -176,8 +126,7 @@ class Stop(BaseModel):
 
 
 class Accessorial(BaseModel):
-    """A charge beyond the line haul. These are carrier revenue and were invisible
-    before — every one is a line item on the rate con."""
+    
     type: Literal[
         "detention_pickup", "detention_delivery", "layover", "tonu", "lumper",
         "stop_off", "driver_assist", "tarp", "reconsignment", "unloading", "other",
@@ -187,8 +136,7 @@ class Accessorial(BaseModel):
 
 
 class Reference(BaseModel):
-    """Any other identifying number on the document. `order_number` alone was absorbing
-    PO numbers, pickup numbers and appointment numbers indiscriminately."""
+    """Any other identifying number on the document. """
     ref_type: Literal["po", "pickup", "delivery", "appointment", "customer",
                       "trailer", "container", "seal", "other"]
     value: str
@@ -196,28 +144,14 @@ class Reference(BaseModel):
 
 class Document(BaseModel):
     # Literal (not str) so the response schema actually CONSTRAINS Gemini to these values.
-    # As a plain `str` it returned 21 different spellings; this pins it to the enum.
     doc_type: Literal[
         "rate_confirmation", "bill_of_lading", "proof_of_delivery",
         "invoice", "lumper_receipt", "packing_list", "other",
     ]
     page_range: str
-    # NOTE: the self-reported `confidence` float was REMOVED. On the 1,000-load run
-    # 77.3% of documents reported exactly 1.0, and it was the sole needs_review
-    # trigger on 4 documents out of 2,867 — so it carried almost no signal, while
-    # costing a reasoning step on every document. `illegible` (a boolean, far cheaper
-    # to decide) plus ocr_confidence and unverified_fields carry the quality story.
     illegible: bool = False
-
-    # --- THE POD FIX (issue 2.1) ---------------------------------------------
-    # In a freight packet the POD usually IS the BOL — the same sheet, signed and
-    # stamped at the consignee. Calling that "a bill of lading" is literally correct
-    # and operationally useless: it put the POD rate at 14% of loads when a carrier
-    # cannot invoice without one, so the real rate is near 100%.
-    # ROLE is separate from TYPE. doc_type stays what the page says it is; this flag
-    # records the role, so one document can be both a BOL and the POD.
     is_signed_delivery_copy: Optional[bool] = None
-    delivery_signed_date: Optional[str] = None               # YYYY-MM-DD, from the signature block
+    delivery_signed_date: Optional[str] = None               # YYYY-MM-DD
 
     load_number: Optional[str] = None
     pro_number: Optional[str] = None
@@ -244,12 +178,11 @@ class Document(BaseModel):
     destination_state: Optional[str] = None
     destination_zip: Optional[str] = None
 
-    # First pickup / last delivery, kept for convenience. The FULL itinerary — including
-    # every intermediate stop, which these two fields cannot represent — is in `stops`.
+    # First pickup / last delivery
+    # every intermediate stop is in `stops`.
     pickup_date: Optional[str] = None      # YYYY-MM-DD
     delivery_date: Optional[str] = None
-    # Appointment windows. Dates alone lose the clock, and detention and on-time
-    # performance are both unanswerable without it.
+    # Appointment windows. 
     pickup_appt_start: Optional[str] = None      # HH:MM 24-hour
     pickup_appt_end: Optional[str] = None
     delivery_appt_start: Optional[str] = None
@@ -258,28 +191,20 @@ class Document(BaseModel):
     rate_total: Optional[float] = None
     line_haul: Optional[float] = None
     fuel_surcharge: Optional[float] = None
-    # True when the document prints ONE all-in figure with no line-haul/fuel breakdown.
-    # Stops "line_haul = rate_total" from being read as a real line-haul rate downstream.
+    # docs classified overwrites is_all_in. 
     rate_is_all_in: Optional[bool] = None
     currency: Optional[str] = None
-    # Loaded miles as printed. Rate-per-mile is the single most important derived
-    # feature in freight pricing, and without this it has to be re-derived from a geocoder.
+    # Loaded miles as printed. 
     miles: Optional[float] = None
     payment_net_days: Optional[int] = None
     quick_pay_pct: Optional[float] = None
 
     commodity: Optional[str] = None
     weight: Optional[float] = None
-    # Enum, not free text: the run produced six spellings of pounds (LBS/lbs/lb/LB/Lbs/
-    # pounds) plus 145 nulls. A null treated as pounds when the document was in kg is a
-    # 2.2x error, so this is pinned.
     weight_unit: Optional[Literal["lb", "kg"]] = None
     pieces: Optional[int] = None
     pallet_count: Optional[int] = None
     pallet_spaces: Optional[int] = None
-    # equipment_type was free text and produced 100+ spellings of one concept ("Van",
-    # "Van Min L=53", "53 FT Dry Van", "V", "V53", "Van 53'", ...). Split into a pinned
-    # class + the numbers that were buried inside those strings.
     equipment_class: Optional[Literal[
         "dry_van", "reefer", "flatbed", "step_deck", "power_only",
         "container", "tanker", "other",
@@ -301,28 +226,10 @@ class Document(BaseModel):
     pieces_received: Optional[int] = None
     osd_code: Optional[Literal["clear", "shortage", "overage", "damage", "refused"]] = None
 
-    # --- repeated groups -----------------------------------------------------
-    # NOT bounded via the schema, and that is a deliberate, expensive lesson.
-    #
-    # Adding Pydantic max_length here emitted "maxItems", and Vertex rejected EVERY
-    # request with a bare 400 INVALID_ARGUMENT naming no field. maxItems appears in the
-    # OpenAPI 3.0 subset that response_schema is documented against, and types.Schema in
-    # the SDK exposes max_items - neither is evidence the API accepts it in this
-    # position. The payload diagnostics proved it: images, sizes and OCR text were all
-    # normal, prompt_chars and schema_chars identical on every failure, and the failing
-    # set grew with runtime rather than staying fixed to particular packets.
-    #
-    # ONLY add a schema keyword here after a single live call proves it is accepted.
-    # The runaway (~3% of packets generating output until they hit the ceiling) is
-    # therefore still open, and MAX_OUTPUT_TOKENS is the only thing bounding it.
     stops: List[Stop] = []
     accessorials: List[Accessorial] = []
     references: List[Reference] = []
 
-    # --- provenance (issue 5.1) ----------------------------------------------
-    # The verbatim string these numbers were read from, so verify_document can match
-    # EVIDENCE against the OCR text instead of a normalized number. Replaces the
-    # self-reported confidence float that was dropped: this is checkable, that was not.
     rate_total_evidence: Optional[str] = None    # e.g. "$1,600.00"
     weight_evidence: Optional[str] = None        # e.g. "32,268 LBS"
 
@@ -388,14 +295,8 @@ Rules:
     number from the total. NEVER copy rate_total into line_haul.
   * fuel_surcharge = ONLY a fuel/FSC line item that is part of that same total. A fuel
     surcharge SCHEDULE or rate table is not a charge — ignore it.
-  * rate_is_all_in = true when one total is shown with no breakdown (line_haul and
-    fuel_surcharge then omitted); false when a real breakdown is printed.
-  * DECIDE IT THIS WAY, it is the most common mistake: if the number you are about to put
-    in line_haul is the SAME as rate_total, then the document did NOT print a breakdown.
-    Set rate_is_all_in true and OMIT line_haul and fuel_surcharge. Set rate_is_all_in
-    false ONLY when the page shows line haul and fuel as two SEPARATE amounts that add up
-    to the total. "TOTAL: $3,500" alone is all-in. "LINE HAUL $2,900 / FUEL $600 /
-    TOTAL $3,500" is a breakdown. A total repeated in a summary box is not a breakdown.
+  * rate_is_all_in — ignore this field, a downstream rule sets it. Just leave line_haul
+    and fuel_surcharge empty when the page prints only a single total.
   * accessorials = every OTHER charge line: detention, layover, TONU, lumper, stop-off,
     driver assist, tarp, reconsignment. One entry each, with its amount.
   * miles = loaded miles as printed on the document. Do not calculate it.
@@ -427,10 +328,10 @@ Rules:
 
 Worked examples:
   Rate con line "LINE HAUL 5,415.20 / FUEL 1,084.80 / TOTAL 6,500.00"
-    -> rate_total 6500, line_haul 5415.20, fuel_surcharge 1084.80, rate_is_all_in false,
+    -> rate_total 6500, line_haul 5415.20, fuel_surcharge 1084.80,
        rate_total_evidence "6,500.00"
   Rate con line "TOTAL CARRIER PAY: $3,500.00" and nothing else
-    -> rate_total 3500, rate_is_all_in true, line_haul and fuel_surcharge OMITTED
+    -> rate_total 3500, line_haul and fuel_surcharge OMITTED
   Commodity "30 PALLETS DRY PRODUCT", weight "32,955 LBS"
     -> pallet_count 30, commodity "30 PALLETS DRY PRODUCT", weight 32955, weight_unit lb,
        weight_evidence "32,955 LBS", pieces OMITTED
@@ -484,9 +385,7 @@ def find_multi_pdf_loads(pdf_blobs) -> set:
             manifest.append(f"{lid} ({len(files)} PDFs)")
             manifest.extend(f"    {f}" for f in files)
         bucket.blob("logs/multi_pdf_loads.txt").upload_from_string("\n".join(manifest))
-        print(f"[!] {len(multi)} of {len(loads)} loads have multiple PDFs - skipping them "
-              f"for now (multi-doc support later).")
-        print(f"    Wrote {csv_path} + gs://{BUCKET}/logs/multi_pdf_loads.txt")
+        print(f"[!] {len(multi)} of {len(loads)} Folders have multiple PDFs -Skipped. See {BUCKET}/logs/multi_pdf_loads.txt")
     else:
         print(f"[ok] All {len(loads)} loads have exactly one PDF.")
 
@@ -511,13 +410,10 @@ def is_transient(exc: BaseException) -> bool:
     return False
 
 
-# OCR and Gemini are retried INDEPENDENTLY. They used to share one decorator, so a
-# Gemini 429 — the exact failure MAX_WORKERS tuning provokes — re-ran Document AI from
-# scratch and re-paid for OCR up to 5 times. OCR is the dominant per-page cost.
 _transient_retry = retry(
     retry=retry_if_exception(is_transient),
-    wait=wait_exponential(multiplier=2, min=4, max=60),
-    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=4, max=120),
+    stop=stop_after_attempt(8),
     reraise=True,
 )
 
@@ -542,18 +438,7 @@ def validate_pdf(pdf_bytes: bytes) -> None:
 
 
 def render_pages(pdf_bytes: bytes) -> List[bytes]:
-    """Rasterize every page to a JPEG whose LONG EDGE is at most MAX_PAGE_PX.
-
-    We already hold the PDF bytes (downloaded for validate_pdf), so this costs no extra
-    fetch. Scaling by pixel dimension rather than DPI is deliberate: Gemini prices images
-    by 768px tile count, so the cost is a staircase. Capping the long edge at 1536 puts
-    every page — Letter, Legal, A4, or an odd scan — in a 2x2 grid, 4 tiles, 1,032 tokens.
-    Going one pixel over buys a whole extra tile row at no benefit.
-
-    Scaling by the LONG edge means an extreme aspect ratio can round the SHORT edge to
-    zero, and a zero-dimension image is rejected by Vertex as a bare
-    "400 INVALID_ARGUMENT" that names nothing. Both dimensions are floored at 1px and
-    the encoded result is checked, so a degenerate page can never poison a request."""
+    """Rasterize every page to a JPEG whose LONG EDGE is at most MAX_PAGE_PX. """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         out = []
@@ -580,18 +465,6 @@ def render_pages(pdf_bytes: bytes) -> List[bytes]:
         doc.close()
 
 
-# Vertex's response_schema accepts an OpenAPI 3.0 SUBSET, not full JSON Schema. Anything
-# outside it makes the API reject the whole request with a bare
-#   400 INVALID_ARGUMENT: Request contains an invalid argument
-# which names no field and points at nothing. Learned the hard way: adding Pydantic
-# max_length to six string fields emitted "maxLength", and every single call 400'd.
-# maxItems IS supported (and is what bounds the runaway arrays); maxLength is NOT.
-# This is an ALLOW-LIST OF WHAT HAS ACTUALLY WORKED, not what the docs permit. It is
-# exactly the set of keywords Pydantic emitted in the schema that ran successfully on
-# 2026-07-30. minItems/maxItems are deliberately ABSENT: they are documented as part of
-# the subset, but adding maxItems 400'd every single request.
-# Do not widen this list from documentation. Widen it only after one live call proves
-# the new keyword is accepted.
 _VERTEX_SCHEMA_KEYS = {
     "type", "format", "description", "nullable", "enum", "items", "properties",
     "required", "propertyOrdering", "anyOf", "$ref", "$defs", "default",
@@ -599,17 +472,7 @@ _VERTEX_SCHEMA_KEYS = {
 
 
 def _lean_response_schema() -> dict:
-    """Packet's JSON schema, reduced to what Vertex actually accepts.
-
-    Two jobs:
-      1. Drop Pydantic's auto-generated "title" keys. Each merely restates the field name
-         in title case ("pro_number" -> "Pro Number") — 21% of the schema, sent as input
-         on every one of 17,112 calls to tell the model nothing the key didn't say.
-      2. Drop any keyword outside the Vertex subset, so a future Pydantic constraint can
-         never again take the whole run down with an unattributable 400.
-
-    Filtering is context-aware: keys are filtered on SCHEMA nodes, but the maps under
-    "properties" and "$defs" are keyed by FIELD NAME and must pass through untouched."""
+    """Return a copy of Packet.model_json_schema() with only the keys that constrain Gemini's output."""
     def schema_node(node):
         if not isinstance(node, dict):
             return [schema_node(v) for v in node] if isinstance(node, list) else node
@@ -637,9 +500,8 @@ def ocr_cache_path(load_id: str) -> str:
 
 
 def load_cached_ocr(load_id: str):
-    """Return (full_text, page_text, page_conf) from GCS, or None if not cached.
-    Document AI output never changes for a given PDF, so a re-run should never re-buy
-    it — and re-runs are expected, because the prompt and schema will keep changing."""
+    """Return (full_text, page_text, page_conf) from GCS, or None if not cached."""
+    
     if not CACHE_OCR:
         return None
     blob = bucket.blob(ocr_cache_path(load_id))
@@ -669,23 +531,59 @@ def ocr_document(pdf_bytes: bytes):
     """Run Document AI OCR. Returns (full_text, per_page_text, per_page_mean_confidence).
     per_page_text lets the cross-check verify a document against ONLY its own pages."""
     name = docai_client.processor_path(PROJECT_ID, DOCAI_LOCATION, OCR_PROCESSOR_ID)
-    result = docai_client.process_document(
-        request=documentai.ProcessRequest(
-            name=name,
-            raw_document=documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf"),
+    def _one_call(chunk_bytes: bytes):
+        """OCR up to OCR_PAGE_LIMIT pages. Returns (text, [page_text], [page_conf])."""
+        result = docai_client.process_document(
+            request=documentai.ProcessRequest(
+                name=name,
+                raw_document=documentai.RawDocument(
+                    content=chunk_bytes, mime_type="application/pdf"),
+                imageless_mode=True,
+            )
         )
-    )
-    doc = result.document
-    full_text = doc.text or ""
-    with _usage_lock:
-        USAGE["ocr_pages"] += len(doc.pages)    # every page here is a billable OCR page
-    page_conf, page_text = [], []
-    for page in doc.pages:
-        confs = [t.layout.confidence for t in page.tokens if t.layout and t.layout.confidence]
-        page_conf.append(round(sum(confs) / len(confs), 3) if confs else 0.0)
-        # slice this page's own text out of the full document text (for page-scoped checks)
-        segs = page.layout.text_anchor.text_segments if page.layout and page.layout.text_anchor else []
-        page_text.append("".join(full_text[int(s.start_index):int(s.end_index)] for s in segs))
+        doc = result.document
+        text = doc.text or ""
+        with _usage_lock:
+            USAGE["ocr_pages"] += len(doc.pages)   # every page here is a billable OCR page
+        confs_out, text_out = [], []
+        for page in doc.pages:
+            confs = [t.layout.confidence for t in page.tokens if t.layout and t.layout.confidence]
+            confs_out.append(round(sum(confs) / len(confs), 3) if confs else 0.0)
+            # slice this page's own text out of THIS CHUNK's text (offsets are chunk-relative)
+            segs = page.layout.text_anchor.text_segments if page.layout and page.layout.text_anchor else []
+            text_out.append("".join(text[int(s.start_index):int(s.end_index)] for s in segs))
+        return text, text_out, confs_out
+
+    
+    doc_pages = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        n_pages = doc_pages.page_count
+    finally:
+        doc_pages.close()
+
+    if n_pages <= OCR_PAGE_LIMIT:
+        return _one_call(pdf_bytes)
+
+    # Oversized packet: OCR it in page-ordered chunks and stitch the results.
+    
+   
+    full_text, page_text, page_conf = "", [], []
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for start in range(0, n_pages, OCR_PAGE_LIMIT):
+            end = min(start + OCR_PAGE_LIMIT, n_pages) - 1
+            part = fitz.open()
+            try:
+                part.insert_pdf(src, from_page=start, to_page=end)
+                chunk_bytes = part.tobytes()
+            finally:
+                part.close()
+            t, pt, pc = _one_call(chunk_bytes)
+            full_text += ("\n" if full_text else "") + t
+            page_text.extend(pt)
+            page_conf.extend(pc)
+    finally:
+        src.close()
     return full_text, page_text, page_conf
 
 
@@ -724,30 +622,14 @@ def page_text_for(page_range: str, page_text) -> str:
 
 
 # Fields worth cross-checking against the OCR text — the hallucination-prone ones
-# (money + identifiers). Dates/names are skipped: Gemini reformats them, so a literal
-# match would false-alarm.
-#
-# KNOW THE LIMITS of this check before trusting it either way:
-#   - It is strong on LONG values (7+ digit IDs, 4+ digit money). Those cannot match
-#     by accident, so a flag there is a real signal.
-#   - It is weak on SHORT numbers. The page text is normalized into one unbroken
-#     string, so a 2-3 digit value matches almost any page by coincidence — "verified"
-#     there means very little.
-#   - pallet_count was REMOVED for exactly that reason: a real count is 1-60, i.e. 1-2
-#     characters, so it was always skipped by the length guard below and never actually
-#     checked. It flagged 0.7% of rows while being wrong ~60% of the time. Plausibility
-#     (1-60) is enforced in the gold layer instead, which is a check that works.
+# (money + identifiers). 
 KEY_FIELDS = [
     "load_number", "pro_number", "bol_number", "order_number", "rc_number",
     "broker_mc", "carrier_mc", "carrier_dot", "carrier_scac",
     "rate_total", "line_haul", "fuel_surcharge", "weight",
 ]
 
-# Fields the model returns VERBATIM source text for. Checking the evidence string is
-# strictly better than checking the parsed number: "$1,600.00" is 6 significant
-# characters that cannot match a page by accident, whereas the normalized 1600 is a
-# 4-digit prefix that often can. Where evidence is present it REPLACES the numeric
-# check for that field; where the model omitted it, the numeric check still runs.
+# Fields the model returns VERBATIM source text for.
 EVIDENCE_FIELDS = {"rate_total": "rate_total_evidence", "weight": "weight_evidence"}
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
@@ -770,11 +652,11 @@ def verify_document(doc_dict: dict, norm_text: str) -> str:
         value = doc_dict.get(field)
         if value in (None, "", []):
             continue
-        # Prefer the model's verbatim evidence string when it gave one — it carries far
-        # more signal than the normalized number (see EVIDENCE_FIELDS).
+        # Prefer the model's verbatim evidence string when it gave one 
         ev_key = EVIDENCE_FIELDS.get(field)
         evidence = doc_dict.get(ev_key) if ev_key else None
-        if evidence:
+        # LENGTH GUARD. 
+        if evidence and len(str(evidence)) <= 64:
             if _norm(evidence) not in norm_text:
                 unverified.append(field)
             continue
@@ -787,14 +669,9 @@ def verify_document(doc_dict: dict, norm_text: str) -> str:
 
 
 def marked_ocr_text(full_text: str, page_text) -> str:
-    """OCR text with '--- PAGE n ---' markers so Gemini can tell where each page starts.
-
-    Without these the model was handed one undelimited blob and had to infer every
-    document boundary from the images alone — while page_range accuracy drives the
-    document split, which drives everything downstream. The per-page slices were
-    already being computed for the cross-check; this just sends them too."""
+    """OCR text with '--- PAGE n ---' markers so Gemini can tell where each page starts."""
     if not any(t.strip() for t in page_text):
-        return full_text                        # page slicing yielded nothing — send the blob
+        return full_text                        
     return "\n".join(f"--- PAGE {i} ---\n{t}" for i, t in enumerate(page_text, 1))
 
 
@@ -812,10 +689,7 @@ def gemini_extract(page_images: List[bytes], full_text: str, page_text) -> Packe
         f"the images above, in order):\n{marked_ocr_text(full_text, page_text)}"
     )
 
-    # Vertex answers a malformed request with a bare "400 INVALID_ARGUMENT: Request
-    # contains an invalid argument" - no field, no offset, nothing. That is unactionable
-    # at 17,000 packets, so describe the payload ourselves and attach it to the error.
-    # Everything here is already in hand; it costs nothing until something actually fails.
+
     def _payload_report() -> str:
         dims = []
         for i, img in enumerate(page_images, 1):
@@ -830,7 +704,7 @@ def gemini_extract(page_images: List[bytes], full_text: str, page_text) -> Packe
                         w = int.from_bytes(img[j + 7:j + 9], "big")
                         break
                     j += 2 + int.from_bytes(img[j + 2:j + 4], "big")
-            except Exception:                     # noqa: BLE001 - diagnostics must not throw
+            except Exception:                     # noqa: BLE001 
                 pass
             dims.append(f"p{i}:{w}x{h}/{len(img) // 1024}KB")
         text = marked_ocr_text(full_text, page_text)
@@ -860,8 +734,7 @@ def gemini_extract(page_images: List[bytes], full_text: str, page_text) -> Packe
 
     um = resp.usage_metadata
     if um is None:
-        # Never silently skip. Tokens WERE billed for this call; we just cannot see them,
-        # so the printed total is a floor, not the truth. Count the blind spots.
+        # Never silently skip
         with _usage_lock:
             USAGE["no_usage_meta"] += 1
     else:
@@ -873,21 +746,13 @@ def gemini_extract(page_images: List[bytes], full_text: str, page_text) -> Packe
         with _usage_lock:
             USAGE["in_tokens"] += prompt_t
             USAGE["out_tokens"] += cand_t
-            # billed at the output rate, and NOT part of candidates_token_count
             USAGE["think_tokens"] += think_t
             USAGE["total_tokens"] += total_t
-            # SELF-CHECK. total = prompt + candidates + tool_use + thoughts. If our
-            # component sum drifts from the SDK's own total, we are missing a billable
-            # category — which is exactly how thinking went unnoticed until the invoice
-            # arrived at 2x the estimate. One assertion would have caught it on day one.
+            # SELF-CHECK. total = prompt + candidates + tool_use + thoughts. 
             if total_t and abs(total_t - (prompt_t + cand_t + think_t + tool_t)) > 1:
                 USAGE["tally_mismatch"] += 1
 
-    # TRUNCATION CHECK. With thinking enabled, thinking tokens count against
-    # max_output_tokens — so a big packet can exhaust the budget mid-JSON. That yields
-    # either invalid JSON (a JSONDecodeError, which is NOT transient, so it fails
-    # straight to logs/failed) or, worse, JSON that happens to parse with documents
-    # missing. Fail loudly and specifically instead.
+    # TRUNCATION CHECK. 
     fr = None
     if resp.candidates:
         fr = getattr(resp.candidates[0], "finish_reason", None)
@@ -902,13 +767,7 @@ def gemini_extract(page_images: List[bytes], full_text: str, page_text) -> Packe
             f"of max_output_tokens={MAX_OUTPUT_TOKENS}. Raise MAX_OUTPUT_TOKENS or lower "
             f"THINKING_BUDGET (thinking is charged against the same ceiling)."
         )
-    # A dict response_schema makes resp.parsed a dict rather than a Packet, so always
-    # round-trip through Pydantic — it validates the doc_type enum on the way in, and
-    # fills the omitted (null) fields back to None so the stored JSON stays complete.
-    # Per-call token counts are returned alongside the packet, not just folded into the
-    # global tally. A run-level thinking TOTAL cannot tell you whether 4,000 tokens per
-    # packet is a flat mean or a long tail on a few hard packets — and that is exactly
-    # the fact that decides whether capping THINKING_BUDGET is nearly free or lossy.
+    
     call_stats = {
         "in": getattr(um, "prompt_token_count", 0) or 0 if um else 0,
         "out": getattr(um, "candidates_token_count", 0) or 0 if um else 0,
@@ -940,12 +799,9 @@ def extract_one(load_id: str, pdf_bytes: bytes):
 
 
 def summarize_docs(packet) -> str:
-    """'rate_confirmation:2p bill_of_lading x2:2p POD' — what the packet split into.
+    """'rate_confirmation:2p bill_of_lading x2:2p POD' — what the packet split into."""
 
-    Everything here is already in hand; it just was not being shown. Seeing the doc mix
-    scroll past is the cheapest possible check that the split and the classifier are
-    behaving, and the POD marker makes the signed-BOL fix visible while the run happens
-    instead of after the BigQuery load."""
+    
     agg = defaultdict(lambda: [0, 0])          # doc_type -> [doc_count, page_count]
     has_pod = False
     for d in packet.documents:
@@ -986,11 +842,6 @@ def print_cost_summary(processed: int):
           f"   (THINKING_BUDGET={THINKING_BUDGET}; set 0 to switch off)")
     print(f"  TOTAL (est)  : ~${total:.4f}")
 
-    # ---- What this number still cannot tell you -------------------------------
-    # Print the blind spots every time. The last run's estimate was HALF the invoice
-    # because a whole billable category was invisible and nothing said so.
-    # ASCII only in this whole block: a redirected stdout on Windows is cp1252, and a
-    # stray em-dash here would crash the run's cost tally on its very last line.
     warned = False
     if USAGE["tally_mismatch"]:
         warned = True
@@ -1006,11 +857,7 @@ def print_cost_summary(processed: int):
         print(f"  [!] {USAGE['truncated']:,} calls stopped before finishing (finish_reason "
               f"!= STOP) and were rejected. See logs/failed/. Raise MAX_OUTPUT_TOKENS or "
               f"lower THINKING_BUDGET.")
-    # Independent cross-check: the SDK's own total vs. what we actually priced.
-    # This prints UNCONDITIONALLY. It used to be gated behind `if not warned`, so the
-    # truncation counter suppressed it — and on the first run that had truncations, the
-    # reconciliation this whole tally exists for was silently skipped. An unrelated
-    # warning must never hide the one check that tells you the total can be trusted.
+    # Independent cross-check: 
     summed = USAGE["in_tokens"] + USAGE["out_tokens"] + USAGE["think_tokens"]
     if not USAGE["total_tokens"]:
         print("  cross-check  : SKIPPED - the SDK reported no total_token_count.")
@@ -1023,21 +870,12 @@ def print_cost_summary(processed: int):
             print(f"  cross-check  : clean - SDK total {USAGE['total_tokens']:,} vs priced "
                   f"{summed:,} (drift {drift:+,})")
 
-    # The OCR page COUNT is exact; the RATE is a guess. Give the one division that
-    # calibrates it, because $1.50/1k has never been reconciled against a real invoice.
+   
     if USAGE["ocr_pages"]:
         print(f"  calibrate    : Document AI billed {USAGE['ocr_pages']:,} pages this run. "
               f"Divide your actual Document AI line item by {USAGE['ocr_pages'] / 1000:.3f} "
               f"to get the true per-1k rate, then set DOCAI_OCR_PER_1K_PAGES.")
     if processed:
-        # ASCII only: this is the LAST line of a long run, and a redirected/piped stdout
-        # on Windows is cp1252 - a stray arrow here used to crash the whole cost tally.
-        #
-        # BACKFILL_LOADS is the real processable corpus, not the round 19,000 that every
-        # projection in this project used for months. The 2026-07-30 listing found 17,388
-        # loads, of which 276 are multi-PDF and skipped -> 17,112. The old constant
-        # overstated every projection by ~11%. And these are PACKETS, not documents: at
-        # ~2.4 documents per packet the two differ by more than a factor of two.
         print(f"  Per packet   : ~${total / processed:.5f}   ->  {BACKFILL_LOADS:,} packets "
               f"=~ ${total / processed * BACKFILL_LOADS:.2f}")
         print(f"  NOTE: divisor is the {processed:,} packets that SUCCEEDED. Tokens spent on "
@@ -1046,10 +884,8 @@ def print_cost_summary(processed: int):
 
 def process_blob(blob):
     """Worker (runs in a thread): OCR + extract ONE pdf and write its JSON.
-    Returns (status, load_id, detail) where status is 'ok' | 'invalid' | 'failed'.
-    No shared mutable state except USAGE, which is guarded by _usage_lock inside
-    ocr_document/extract_one. Each PDF's JSON is an independent object, so concurrent
-    writes never collide and resumability is preserved."""
+    Returns (status, load_id, detail) where status is 'ok' | 'invalid' | 'failed'."""
+  
     load_id = load_id_from_pdf(blob.name)
     pdf_uri = f"gs://{BUCKET}/{blob.name}"
     try:
@@ -1057,7 +893,7 @@ def process_blob(blob):
     except Exception as e:                           # noqa: BLE001
         return ("failed", load_id, f"download: {e}")
 
-    # Pre-flight: skip broken PDFs before spending an OCR + Gemini call.
+    # Pre-flight: skip broken PDFs 
     try:
         validate_pdf(pdf_bytes)
     except Exception as e:
@@ -1072,7 +908,7 @@ def process_blob(blob):
         record = packet.model_dump()
         record["load_id"] = load_id
         record["source_pdf"] = pdf_uri
-        # Confidence + cross-check, each scoped to the document's OWN pages.
+        # Confidence + cross-check, each scoped to the document's pages.
         for doc_obj, doc_dict in zip(packet.documents, record["documents"]):
             doc_dict["ocr_confidence"] = ocr_confidence_for(doc_obj.page_range, page_conf)
             scoped = _norm(page_text_for(doc_obj.page_range, page_text))
@@ -1081,23 +917,14 @@ def process_blob(blob):
             json.dumps(record), content_type="application/json"
         )
 
-        # One informative line per packet instead of a bare "ok". Everything here was
-        # already computed; none of it costs an extra call. Watch these scroll and you
-        # can see the split, the classifier, the POD fix, the new repeated groups and
-        # the thinking spend all behaving (or not) while the run is still going.
+
         docs = record["documents"]
         worst_ocr = min((d["ocr_confidence"] for d in docs
                          if d["ocr_confidence"] is not None), default=None)
         flagged = sorted({f for d in docs for f in (d["unverified_fields"] or "").split(",") if f})
         bits = [summarize_docs(packet)]
         bits.append(f"{call_stats['pages']}p")
-        # The ITINERARY, not the sum. Every document reports its own stops — the BOL
-        # always names shipper and consignee — so summing across a 2-document packet
-        # turned a normal 1-pickup/1-delivery load into "4stop" and made two thirds of
-        # the run look multi-stop. This mirrors freight_gold.stops.is_primary_itinerary:
-        # the rate confirmation wins (it is the document that lists intermediate stops),
-        # otherwise the longest list. Same rule in both places, so the terminal and the
-        # warehouse now agree.
+        # The ITINERARY
         rc_stops = [len(d.get("stops") or []) for d in docs
                     if d.get("doc_type") == "rate_confirmation"]
         n_stops = max(rc_stops) if any(rc_stops) else max(
@@ -1109,12 +936,6 @@ def process_blob(blob):
             bits.append(f"{n_acc}acc")
         if worst_ocr is not None:
             bits.append(f"ocr{worst_ocr:.2f}")
-        # out= is here because its absence was a real blind spot: three packets blew the
-        # output ceiling and there was no way to see whether that was the whole
-        # distribution drifting or a handful of outliers, because output was never shown.
-        # A realistically-filled document is ~476 tokens (~631 if nulls are emitted), so
-        # out/ndocs above ~650 means the omit-null rule is being ignored, and a packet
-        # far above ndocs*650 means something is running away.
         bits.append(f"out{call_stats['out']:,}")
         bits.append(f"think{call_stats['think']:,}")
         if call_stats.get("ocr_cached"):
@@ -1127,18 +948,105 @@ def process_blob(blob):
         return ("failed", load_id, str(e))
 
 
+class Progress:
+    """A status line pinned to the bottom of the terminal while results scroll above it."""
+
+    def __init__(self, total: int):
+        self.total = total
+        self.ok = self.failed = self.invalid = 0
+        self._start = time.monotonic()
+        self._lock = threading.Lock()
+        self._live = sys.stdout.isatty()
+        self._stop = threading.Event()
+        self._width = 0
+        self._thread = None
+
+    @staticmethod
+    def _hms(secs: float) -> str:
+        secs = int(max(secs, 0))
+        h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    def _status(self) -> str:
+        done = self.ok + self.failed + self.invalid
+        el = time.monotonic() - self._start
+        rate = done / el if el > 0 else 0.0                  # packets per second
+        eta = (self.total - done) / rate if rate > 0 else 0
+        pct = 100.0 * done / self.total if self.total else 0.0
+        return (f"[{self._hms(el)}] {done}/{self.total} ({pct:.0f}%)  "
+                f"ok={self.ok} failed={self.failed} invalid={self.invalid}  "
+                f"{rate * 60:.1f}/min  eta {self._hms(eta)}")
+
+    def _draw(self) -> None:
+        """Caller must hold the lock. Pads to the previous width so no stale text shows."""
+        if not self._live:
+            return
+        s = self._status()
+        sys.stdout.write("\r" + s + " " * max(0, self._width - len(s)))
+        self._width = len(s)
+        sys.stdout.flush()
+
+    def _erase(self) -> None:
+        if self._live and self._width:
+            sys.stdout.write("\r" + " " * self._width + "\r")
+
+    def line(self, text: str) -> None:
+        with self._lock:
+            self._erase()
+            print(text)
+            self._draw()
+
+    def tick(self, status: str) -> None:
+        with self._lock:
+            if status == "ok":
+                self.ok += 1
+            elif status == "invalid":
+                self.invalid += 1
+            else:
+                self.failed += 1
+
+    def __enter__(self):
+        if self._live:
+            self._thread = threading.Thread(target=self._refresh, daemon=True)
+            self._thread.start()
+        return self
+
+    def _refresh(self) -> None:
+        while not self._stop.wait(1.0):
+            with self._lock:
+                self._draw()
+
+    def __exit__(self, *exc):
+        """Leave the FINAL status line on screen as the run summary."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        with self._lock:
+            self._draw()          # final values
+            if self._live:
+                sys.stdout.write("\n")
+            else:
+                print(self._status())   # non-TTY: the one and only progress line
+            sys.stdout.flush()
+            self._width = 0
+        return False
+
+
 def main():
-    # ONE listing of the PDFs — reused for the multi-PDF check AND the work list.
+   
     all_pdfs = [b for b in storage_client.list_blobs(BUCKET, prefix=PDF_PREFIX)
                 if b.name.lower().endswith(".pdf")]
-    # list_blobs returns ascending load number (oldest first); sort newest-first if configured.
+  
     all_pdfs.sort(key=lambda b: _load_num(b.name), reverse=NEWEST_FIRST)
     skip_multi = find_multi_pdf_loads(all_pdfs)
-    done = already_done()                            # separate prefix (json/); listed once
-    print(f"{len(all_pdfs)} PDFs found; {len(done)} loads already done; "
-          f"{len(skip_multi)} multi-PDF loads skipped.")
+    done = already_done()                        
+    print(f"Connected to {PROJECT_ID}--{BUCKET}/{PDF_PREFIX}\n in Region {LOCATION}\n"
+          f"{len(all_pdfs)} PDFs found; {len(done)} docs already parsed;\n "
+          f"{len(skip_multi)} multi-PDF loads skipped.\n"
+          f"Limit = {LIMIT if LIMIT is not None else 'None'}, Max Workers = {MAX_WORKERS} \n"
+          f"Writing extractions to {BUCKET}/{JSON_PREFIX}")
 
-    # Build the work list (skip already-done + multi-PDF), capped at LIMIT.
+    # Build the work list 
     work = []
     for b in all_pdfs:
         load_id = load_id_from_pdf(b.name)
@@ -1149,30 +1057,26 @@ def main():
             break
 
     print(f"Processing {len(work)} loads with {MAX_WORKERS} concurrent workers...")
-    ok = failed = invalid = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    with Progress(len(work)) as prog, ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(process_blob, b): b for b in work}
-        for i, fut in enumerate(as_completed(futures), 1):
+        for fut in as_completed(futures):
             b = futures[fut]
             try:
                 status, load_id, detail = fut.result()
             except Exception as e:                   # noqa: BLE001 — a worker crashed unexpectedly
-                failed += 1
-                print(f"[FAIL] {load_id_from_pdf(b.name)}: worker crashed: {e}", file=sys.stderr)
+                prog.tick("failed")
+                prog.line(f"[FAIL] {load_id_from_pdf(b.name)}: worker crashed: {e}")
                 continue
+            prog.tick(status)
             if status == "ok":
-                ok += 1
-                print(f"[ok] {load_id:>8}  {detail}")
+                prog.line(f"[ok] {load_id:>8}  {detail}")
             elif status == "invalid":
-                invalid += 1
-                print(f"[skip invalid] {load_id}: {detail}", file=sys.stderr)
+                prog.line(f"[skip invalid] {load_id}: {detail}")
             else:
-                failed += 1
-                print(f"[FAIL] {load_id}: {detail}", file=sys.stderr)
-            if i % 50 == 0:
-                print(f"  ...{i}/{len(work)}  (ok={ok} failed={failed} invalid={invalid})")
+                prog.line(f"[FAIL] {load_id}: {detail}")
+        ok = prog.ok
 
-    print(f"Done. ok={ok}, failed={failed}, invalid={invalid} of {len(work)} attempted.")
+    
     print_cost_summary(ok)
 
 

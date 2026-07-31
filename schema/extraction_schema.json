@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Freight load packet extraction",
-  "description": "What Gemini returns for ONE PDF (one load). A packet contains several documents; each is described in the 'documents' array. This file is the human-readable spec \u2014 the machine version is the Pydantic model in pipeline/extract.py, and the BigQuery DDL in schema/bigquery_setup.sql is generated from that same model. Change the Pydantic model first, then regenerate the other two. 66 fields per document.",
+  "description": "What Gemini returns for ONE PDF (one load). A packet contains several documents; each is described in the 'documents' array. ",
   "type": "object",
   "properties": {
     "load_id": {
