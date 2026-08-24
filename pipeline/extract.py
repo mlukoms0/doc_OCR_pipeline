@@ -53,13 +53,13 @@ MAX_OUTPUT_TOKENS = 16384
 
 #PDF_PREFIX - point to the GCS Bucket folder where raw docs are stored. 
 
-PDF_PREFIX  = "raw/loads/"
+PDF_PREFIX  = "_____"
 # Output prefix. BUMP THIS instead of deleting, whenever the prompt or schema changes.
 #
 # Point `bq load` at whichever prefix you want in BigQuery.
 
-JSON_PREFIX = "json_final/"
-OCR_PREFIX  = "ocr/"          # cached Document AI output, one <load_id>.json per packet
+JSON_PREFIX = "______"
+OCR_PREFIX  = "_____"          # cached Document AI output, one <load_id>.json per packet
 MODEL       = "gemini-2.5-flash"
 
 client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
@@ -527,7 +527,7 @@ def ocr_document(pdf_bytes: bytes):
         for page in doc.pages:
             confs = [t.layout.confidence for t in page.tokens if t.layout and t.layout.confidence]
             confs_out.append(round(sum(confs) / len(confs), 3) if confs else 0.0)
-            # slice this page's own text out of THIS CHUNK's text (offsets are chunk-relative)
+            # slice this page's own text out of this chunks's text 
             segs = page.layout.text_anchor.text_segments if page.layout and page.layout.text_anchor else []
             text_out.append("".join(text[int(s.start_index):int(s.end_index)] for s in segs))
         return text, text_out, confs_out
@@ -621,10 +621,9 @@ def _norm(value) -> str:
 
 
 def verify_document(doc_dict: dict, norm_text: str) -> str:
-    """Deterministic cross-check (NO AI, NO cost): which KEY_FIELDS hold a value that
-    does NOT appear in the OCR text of THIS document's own pages? Catches hallucinated
-    values. `norm_text` is the already-normalized text for the doc's page range.
-    Returns a comma-joined list of field names ('' if all verified)."""
+    """Deterministic cross-check (NO AI, NO cost): Catches hallucinated
+    values. Returns a comma-joined list of field names ('' if all verified)."""
+    
     unverified = []
     for field in KEY_FIELDS:
         value = doc_dict.get(field)
@@ -655,11 +654,8 @@ def marked_ocr_text(full_text: str, page_text) -> str:
 
 @_transient_retry
 def gemini_extract(page_images: List[bytes], full_text: str, page_text) -> Packet:
-    """One Gemini call: page images + page-marked OCR text -> structured Packet.
+    """One Gemini call: page images + page-marked OCR text -> structured Packet."""
 
-    Content order is deliberate. The static PROMPT goes FIRST so every one of the 19k
-    calls shares an identical prefix; the per-PDF images and OCR text follow. Previously
-    the PDF came first, which put variable bytes at the head of every request."""
     contents = [PROMPT]
     contents += [types.Part.from_bytes(data=img, mime_type="image/jpeg") for img in page_images]
     contents.append(
