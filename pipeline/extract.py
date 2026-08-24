@@ -1,25 +1,3 @@
-"""
-Freight packet extraction — Document AI OCR + Gemini, one pass per PDF.
-
-Per PDF:
-  - Validate the PDF opens and has pages (skip broken files)
-  - Document AI OCR -> reliable text layer + per-page confidence
-  - Render the pages locally at RENDER_DPI as JPEGs (cheaper than shipping the
-    raw PDF: Gemini bills images by tile count, so DPI drives input cost)
-  - Gemini reads the IMAGES + the PAGE-MARKED OCR TEXT together -> structured JSON
-    (images for layout/classification, OCR text for exact numbers/IDs)
-  - Attach Document AI's confidence to each extracted document
-  - Write gs://<BUCKET>/<JSON_PREFIX>/<load_id>.json  (resumable)
-
-Request layout is deliberate: the static PROMPT goes FIRST so the prefix is
-identical across every call, then the per-PDF images, then the OCR text.
-
-Each document is extracted from ITS OWN pages only — values are never carried
-from one document to another here. Cross-document fill (e.g. stamping the rate
-con's load_number onto the BOL) happens in the gold layer, where it is auditable.
-
-Run the PILOT first (LIMIT = 100), review in BigQuery, then set LIMIT = None.
-"""
 
 import csv
 import json
@@ -44,16 +22,16 @@ from pydantic import BaseModel, Field
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
 
 # ============ EDIT THESE VALUES ============
-PROJECT_ID       = "144240581301"
-LOCATION         = "us-east1"         
-BUCKET           = "doc-archive67"
+PROJECT_ID       = "____"
+LOCATION         = "___"         
+BUCKET           = "_____"
 #Set limit = <int> for test runs, = None for full run.
 LIMIT            = None     
 #Doc concurrency scans. Limit to avoid api request errors. default = 12
 MAX_WORKERS      = 10
 NEWEST_FIRST     = False                 
 DOCAI_LOCATION   = "us"
-OCR_PROCESSOR_ID = "a889dd87be6492b0"
+OCR_PROCESSOR_ID = "_____"
 
 # Page images sent to Gemini.
 MAX_PAGE_PX      = 1536   # long-edge cap in pixels; keep <= 1536 to stay at 4 tiles
